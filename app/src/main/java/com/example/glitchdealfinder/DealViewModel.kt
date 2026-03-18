@@ -121,13 +121,18 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
                     val currentKeywords = _searchKeywords.value
                     val matchesWatchList = currentKeywords.any { title.contains(it, true) }
 
-                    // Better initial filter
+                    // Refined initial filter to exclude shipping-related "FREE" mentions
+                    val hasFreeShippingMention = title.contains("free shipping", true) || 
+                                               title.contains("free s/h", true) || 
+                                               title.contains("free s&h", true) ||
+                                               title.contains("free s ", true)
+                    
                     val isLikelyGlitch = (title.contains("glitch", true) || 
                                        title.contains("mistake", true) || 
                                        title.contains("pricing error", true) ||
                                        title.contains("85%", true) ||
                                        title.contains("90%", true)) ||
-                                       (title.contains("free", true) && !title.contains("free shipping", true) && !title.contains("free s/h", true))
+                                       (title.contains("free", true) && !hasFreeShippingMention)
 
                     if (isLikelyGlitch || matchesWatchList) {
                         _statusMessage.value = "Deep Scanning: ${title.take(15)}..."
@@ -227,10 +232,16 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
             val currentPrice = parseCurrentPrice(doc, title)
             val originalPrice = parseHistoricalPrice(doc, currentPrice)
 
-            // HARD FIX: If price is 0, we MUST see "FREE" or "$0" in title, AND it can't be "FREE SHIPPING"
+            // Refined check for free products vs free shipping
             if (currentPrice <= 0) {
-                val titleHasFreeProduct = (title.contains("free", true) && !title.contains("free shipping", true) && !title.contains("free s/h", true)) ||
+                val hasFreeShippingMention = title.contains("free shipping", true) || 
+                                           title.contains("free s/h", true) || 
+                                           title.contains("free s&h", true) ||
+                                           title.contains("free s ", true)
+                
+                val titleHasFreeProduct = (title.contains("free", true) && !hasFreeShippingMention) ||
                                          title.contains("$0.00") || title.contains("0.00")
+                
                 if (!titleHasFreeProduct) return null
             }
 
@@ -243,9 +254,13 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
                 url = url
             )
         } catch (e: Exception) {
-            // Only fallback if the title is VERY explicit about the glitch
+            val hasFreeShippingMention = title.contains("free shipping", true) || 
+                                       title.contains("free s/h", true) || 
+                                       title.contains("free s&h", true) ||
+                                       title.contains("free s ", true)
+            
             val isExplicitGlitch = title.contains("$0.01") || title.contains("penny", true) || 
-                                  (title.contains("free", true) && !title.contains("free shipping", true))
+                                  (title.contains("free", true) && !hasFreeShippingMention)
             
             if (isExplicitGlitch) {
                 return Deal(id = id, title = title, price = 0.01, originalPrice = 10.0, store = extractStore(title), url = url)
