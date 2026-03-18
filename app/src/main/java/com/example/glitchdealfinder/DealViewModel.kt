@@ -121,12 +121,13 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
                     val currentKeywords = _searchKeywords.value
                     val matchesWatchList = currentKeywords.any { title.contains(it, true) }
 
-                    val isLikelyGlitch = title.contains("glitch", true) || 
+                    // Better initial filter
+                    val isLikelyGlitch = (title.contains("glitch", true) || 
                                        title.contains("mistake", true) || 
-                                       title.contains("free", true) ||
+                                       title.contains("pricing error", true) ||
                                        title.contains("85%", true) ||
-                                       title.contains("90%", true) ||
-                                       title.contains("pricing error", true)
+                                       title.contains("90%", true)) ||
+                                       (title.contains("free", true) && !title.contains("free shipping", true) && !title.contains("free s/h", true))
 
                     if (isLikelyGlitch || matchesWatchList) {
                         _statusMessage.value = "Deep Scanning: ${title.take(15)}..."
@@ -226,10 +227,11 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
             val currentPrice = parseCurrentPrice(doc, title)
             val originalPrice = parseHistoricalPrice(doc, currentPrice)
 
-            // VALIDATION: If we found a was-price but current price is 0, 
-            // and the title doesn't say "free", it's a parsing error.
-            if (currentPrice <= 0 && originalPrice > 0 && !title.contains("free", true)) {
-                return null
+            // HARD FIX: If price is 0, we MUST see "FREE" or "$0" in title, AND it can't be "FREE SHIPPING"
+            if (currentPrice <= 0) {
+                val titleHasFreeProduct = (title.contains("free", true) && !title.contains("free shipping", true) && !title.contains("free s/h", true)) ||
+                                         title.contains("$0.00") || title.contains("0.00")
+                if (!titleHasFreeProduct) return null
             }
 
             Deal(
@@ -241,7 +243,11 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
                 url = url
             )
         } catch (e: Exception) {
-            if (title.contains("$0.01") || title.contains("penny", true) || title.contains("free", true)) {
+            // Only fallback if the title is VERY explicit about the glitch
+            val isExplicitGlitch = title.contains("$0.01") || title.contains("penny", true) || 
+                                  (title.contains("free", true) && !title.contains("free shipping", true))
+            
+            if (isExplicitGlitch) {
                 return Deal(id = id, title = title, price = 0.01, originalPrice = 10.0, store = extractStore(title), url = url)
             }
             null
@@ -254,14 +260,12 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
             val element = doc.select(selector).first()
             val text = element?.text() ?: ""
             
-            // STRICT CHECK: Text must contain a currency symbol or a decimal to be a price
             if (text.contains("$") || text.contains(".")) {
                 val price = text.replace(Regex("[^\\d.]"), "").toDoubleOrNull()
                 if (price != null && price > 0) return price
             }
         }
         
-        // Fallback to Title Regex, but be more strict
         val priceMatch = Regex("\\$\\d+(\\.\\d{2})?").find(title)
         return priceMatch?.value?.removePrefix("$")?.toDoubleOrNull() ?: 0.0
     }
