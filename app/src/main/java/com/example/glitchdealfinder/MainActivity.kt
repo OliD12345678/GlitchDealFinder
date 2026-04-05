@@ -1,15 +1,23 @@
 package com.example.glitchdealfinder
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
+import android.media.AudioAttributes
 import android.media.AudioManager
+import android.media.SoundPool
 import android.media.ToneGenerator
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -25,12 +33,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -38,6 +49,8 @@ import androidx.tv.material3.*
 import com.example.glitchdealfinder.ui.theme.GlitchDealFinderTheme
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -69,14 +82,15 @@ fun MainScreen(viewModel: DealViewModel) {
     val lastDeal by viewModel.lastFoundDeal.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
     val webhookUrl by viewModel.webhookUrl.collectAsState()
-    
+
     var selectedDeal by remember { mutableStateOf<Deal?>(null) }
     var showAddDialog by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
 
+    // #9: Play alert sound on new deal
     LaunchedEffect(lastDeal) {
         if (lastDeal != null) {
-            playChaChingSound()
+            playAlertSound(lastDeal!!.isGlitch)
         }
     }
 
@@ -88,21 +102,19 @@ fun MainScreen(viewModel: DealViewModel) {
                     Text("⚙️ NOTIFICATIONS")
                 }
             }
-            
+
             Spacer(modifier = Modifier.height(24.dp))
-            
+
             Row(modifier = Modifier.fillMaxSize()) {
-                // Left Panel: Search Items
                 KeywordPanel(
                     keywords = keywords,
                     onRemove = { viewModel.removeKeyword(it) },
                     onShowAdd = { showAddDialog = true },
                     modifier = Modifier.weight(1f)
                 )
-                
+
                 Spacer(modifier = Modifier.width(32.dp))
-                
-                // Right Panel: Deal History
+
                 DualDealHistoryPanel(
                     glitchDeals = glitchDeals,
                     watchlistDeals = watchlistDeals,
@@ -115,7 +127,8 @@ fun MainScreen(viewModel: DealViewModel) {
         val dealToShow = lastDeal ?: selectedDeal
         dealToShow?.let { deal ->
             DealDetailPopup(
-                deal = deal, 
+                deal = deal,
+                viewModel = viewModel,
                 isAlert = lastDeal != null,
                 onDismiss = {
                     viewModel.clearLastDeal()
@@ -132,7 +145,7 @@ fun MainScreen(viewModel: DealViewModel) {
         if (showAddDialog) {
             AddKeywordDialog(
                 onDismiss = { showAddDialog = false },
-                onAdd = { 
+                onAdd = {
                     viewModel.addKeyword(it)
                     showAddDialog = false
                 }
@@ -143,7 +156,7 @@ fun MainScreen(viewModel: DealViewModel) {
             WebhookSettingsDialog(
                 currentUrl = webhookUrl,
                 onDismiss = { showSettingsDialog = false },
-                onSave = { 
+                onSave = {
                     viewModel.updateWebhook(it)
                     showSettingsDialog = false
                 }
@@ -211,7 +224,7 @@ fun KeywordPanel(
             Text("${keywords.size} items", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
         }
         Spacer(modifier = Modifier.height(8.dp))
-        
+
         LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.weight(1f)) {
             items(keywords.toList()) { keyword ->
                 Surface(
@@ -229,7 +242,7 @@ fun KeywordPanel(
                 }
             }
         }
-        
+
         Spacer(modifier = Modifier.height(16.dp))
         Button(onClick = onShowAdd, modifier = Modifier.fillMaxWidth()) {
             Text("+ ADD ITEM / VOICE")
@@ -250,7 +263,7 @@ fun DualDealHistoryPanel(
     Column(modifier = modifier.fillMaxHeight()) {
         Text("ULTIMATE GLITCHES (85%+ OFF)", style = MaterialTheme.typography.titleMedium, color = Color.Red)
         Spacer(modifier = Modifier.height(8.dp))
-        
+
         Box(modifier = Modifier.weight(1f)) {
             DealList(deals = glitchDeals, emptyMessage = "Waiting for unicorns...", onDealClick = onDealClick, dateFormat = dateFormat)
         }
@@ -281,18 +294,33 @@ fun DealList(
             }
         }
         items(deals) { deal ->
+            // #6: Visual distinction for unverified deals
+            val borderColor = if (!deal.verified) Color(0xFFFF9800) else Color.Transparent
+            val bgColor = if (!deal.verified) Color(0xFF1A1500) else Color(0xFF1A1A1A)
+
             Surface(
                 onClick = { onDealClick(deal) },
                 shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(12.dp)),
-                colors = ClickableSurfaceDefaults.colors(containerColor = Color(0xFF1A1A1A)),
-                modifier = Modifier.fillMaxWidth()
+                colors = ClickableSurfaceDefaults.colors(containerColor = bgColor),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .then(if (!deal.verified) Modifier.border(1.dp, borderColor, RoundedCornerShape(12.dp)) else Modifier)
             ) {
                 Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text(deal.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, maxLines = 1)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(deal.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            // #6: Unverified badge
+                            if (!deal.verified) {
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("⚠ UNVERIFIED", color = Color(0xFFFF9800), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
                         Text("${deal.store} • ${dateFormat.format(Date(deal.timestamp))}", color = Color.Gray, fontSize = 12.sp)
                     }
-                    
+
+                    Spacer(modifier = Modifier.width(12.dp))
+
                     Column(horizontalAlignment = Alignment.End) {
                         Text(
                             text = "${deal.discountPercentage}% OFF",
@@ -315,8 +343,9 @@ fun DealList(
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-fun DealDetailPopup(deal: Deal, isAlert: Boolean, onDismiss: () -> Unit, onRemove: () -> Unit) {
+fun DealDetailPopup(deal: Deal, viewModel: DealViewModel, isAlert: Boolean, onDismiss: () -> Unit, onRemove: () -> Unit) {
     val focusRequester = remember { FocusRequester() }
+    val context = LocalContext.current
 
     LaunchedEffect(Unit) {
         focusRequester.requestFocus()
@@ -330,7 +359,7 @@ fun DealDetailPopup(deal: Deal, isAlert: Boolean, onDismiss: () -> Unit, onRemov
             onClick = onDismiss,
             shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(24.dp)),
             colors = ClickableSurfaceDefaults.colors(containerColor = Color(0xFF1E1E1E)),
-            modifier = Modifier.width(500.dp)
+            modifier = Modifier.width(550.dp)
         ) {
             Column(
                 modifier = Modifier.padding(32.dp),
@@ -342,8 +371,19 @@ fun DealDetailPopup(deal: Deal, isAlert: Boolean, onDismiss: () -> Unit, onRemov
                     Text("DEAL DETAILS", color = Color.Cyan, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                 }
 
+                // #6: Unverified warning
+                if (!deal.verified) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "⚠ PRICE UNVERIFIED — could not scrape retailer page",
+                        color = Color(0xFFFF9800),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
                 Spacer(modifier = Modifier.height(16.dp))
-                
+
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(deal.title, color = Color.White, style = MaterialTheme.typography.bodyLarge)
@@ -355,26 +395,53 @@ fun DealDetailPopup(deal: Deal, isAlert: Boolean, onDismiss: () -> Unit, onRemov
                             color = Color.Green,
                             fontWeight = FontWeight.Bold
                         )
+                        if (deal.originalPrice > 0) {
+                            Text("was $${String.format(Locale.US, "%.2f", deal.originalPrice)}", color = Color.Gray, fontSize = 14.sp)
+                        }
                         Text("at ${deal.store}", color = Color.LightGray)
                     }
-                    
+
                     Spacer(modifier = Modifier.width(24.dp))
-                    
+
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        QRCodeImage(url = deal.url)
+                        // #7: Async QR code generation
+                        AsyncQRCodeImage(url = deal.productUrl.ifBlank { deal.url })
                         Spacer(modifier = Modifier.height(8.dp))
                         Text("Scan to Buy", color = Color.White, fontSize = 12.sp)
                     }
                 }
-                
+
                 Spacer(modifier = Modifier.height(24.dp))
-                
-                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    // #10: Share button
+                    Button(
+                        onClick = {
+                            val shareText = viewModel.getShareText(deal)
+                            // Copy to clipboard (works on TV)
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("Deal", shareText))
+                            // Also try share intent (works if phone-like device)
+                            try {
+                                val intent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"
+                                    putExtra(Intent.EXTRA_TEXT, shareText)
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                                context.startActivity(Intent.createChooser(intent, "Share Deal"))
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "Link copied!", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        colors = ButtonDefaults.colors(containerColor = Color(0xFF004400))
+                    ) {
+                        Text("📤 SHARE")
+                    }
                     Button(
                         onClick = onRemove,
                         colors = ButtonDefaults.colors(containerColor = Color(0xFF440000))
                     ) {
-                        Text("REMOVE & BLOCK")
+                        Text("🗑 REMOVE")
                     }
                     Button(
                         onClick = onDismiss,
@@ -388,34 +455,49 @@ fun DealDetailPopup(deal: Deal, isAlert: Boolean, onDismiss: () -> Unit, onRemov
     }
 }
 
+// #7: QR code generated on background thread with loading state
 @Composable
-fun QRCodeImage(url: String) {
-    val bitmap = remember(url) {
-        try {
-            val size = 512
-            val bits = QRCodeWriter().encode(url, BarcodeFormat.QR_CODE, size, size)
-            Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565).apply {
-                for (x in 0 until size) {
-                    for (y in 0 until size) {
-                        setPixel(x, y, if (bits[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+fun AsyncQRCodeImage(url: String) {
+    var bitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var loading by remember { mutableStateOf(true) }
+
+    LaunchedEffect(url) {
+        loading = true
+        bitmap = withContext(Dispatchers.Default) {
+            try {
+                val size = 512
+                val bits = QRCodeWriter().encode(url, BarcodeFormat.QR_CODE, size, size)
+                Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565).apply {
+                    for (x in 0 until size) {
+                        for (y in 0 until size) {
+                            setPixel(x, y, if (bits[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+                        }
                     }
                 }
+            } catch (e: Exception) {
+                null
             }
-        } catch (e: Exception) {
-            null
         }
+        loading = false
     }
 
-    bitmap?.let {
-        Image(
-            bitmap = it.asImageBitmap(),
-            contentDescription = "QR Code",
-            modifier = Modifier
-                .size(150.dp)
-                .clip(RoundedCornerShape(8.dp))
-                .background(Color.White)
-                .padding(8.dp)
-        )
+    Box(
+        modifier = Modifier
+            .size(150.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(Color.White)
+            .padding(8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        if (loading || bitmap == null) {
+            Text("Loading...", color = Color.Gray, fontSize = 12.sp)
+        } else {
+            Image(
+                bitmap = bitmap!!.asImageBitmap(),
+                contentDescription = "QR Code",
+                modifier = Modifier.fillMaxSize()
+            )
+        }
     }
 }
 
@@ -434,7 +516,7 @@ fun AddKeywordDialog(onDismiss: () -> Unit, onAdd: (String) -> Unit) {
         contentAlignment = Alignment.Center
     ) {
         Surface(
-            onClick = {}, 
+            onClick = {},
             shape = ClickableSurfaceDefaults.shape(RoundedCornerShape(24.dp)),
             colors = ClickableSurfaceDefaults.colors(containerColor = Color(0xFF1E1E1E)),
             modifier = Modifier.width(600.dp)
@@ -446,7 +528,7 @@ fun AddKeywordDialog(onDismiss: () -> Unit, onAdd: (String) -> Unit) {
                 Text("ADD SEARCH ITEM", style = MaterialTheme.typography.headlineSmall, color = Color.Yellow)
                 Spacer(modifier = Modifier.height(8.dp))
                 Text("Type an item name or use your Mic.", color = Color.Gray)
-                
+
                 Spacer(modifier = Modifier.height(24.dp))
 
                 Box(
@@ -463,7 +545,7 @@ fun AddKeywordDialog(onDismiss: () -> Unit, onAdd: (String) -> Unit) {
                         cursorBrush = SolidColor(Color(0xFF00FFCC)),
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                        keyboardActions = KeyboardActions(onDone = { onAdd(text) }),
+                        keyboardActions = KeyboardActions(onDone = { if (text.isNotBlank()) onAdd(text) }),
                         decorationBox = { innerTextField ->
                             if (text.isEmpty()) {
                                 Text("Enter Item Name...", color = Color.DarkGray, fontSize = 24.sp)
@@ -476,7 +558,7 @@ fun AddKeywordDialog(onDismiss: () -> Unit, onAdd: (String) -> Unit) {
                 Spacer(modifier = Modifier.height(32.dp))
 
                 Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    Button(onClick = { onAdd(text) }) {
+                    Button(onClick = { if (text.isNotBlank()) onAdd(text) }) {
                         Text("ADD ITEM")
                     }
                     Button(onClick = onDismiss) {
@@ -515,7 +597,7 @@ fun WebhookSettingsDialog(currentUrl: String, onDismiss: () -> Unit, onSave: (St
                 Text("DISCORD NOTIFICATIONS", style = MaterialTheme.typography.headlineSmall, color = Color.Cyan)
                 Spacer(modifier = Modifier.height(8.dp))
                 Text("Enter Discord Webhook URL for phone alerts.", color = Color.Gray)
-                
+
                 Spacer(modifier = Modifier.height(24.dp))
 
                 Box(
@@ -555,10 +637,17 @@ fun WebhookSettingsDialog(currentUrl: String, onDismiss: () -> Unit, onSave: (St
     }
 }
 
-fun playChaChingSound() {
+// #9: Better alert sound — multi-tone sequence that grabs attention
+fun playAlertSound(isGlitch: Boolean) {
     try {
         val toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
-        toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
+        if (isGlitch) {
+            // Urgent: three rapid ascending tones for a glitch
+            toneGen.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200)
+        } else {
+            // Gentler: single tone for watchlist match
+            toneGen.startTone(ToneGenerator.TONE_CDMA_PIP, 150)
+        }
     } catch (e: Exception) {
         e.printStackTrace()
     }
