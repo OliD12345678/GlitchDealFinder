@@ -86,9 +86,29 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
     private val _stats = MutableStateFlow(loadStats())
     val stats: StateFlow<DealStats> = _stats.asStateFlow()
 
-    // #10: BrickSeek ZIP code
+    // BrickSeek ZIP code
     private val _zipCode = MutableStateFlow(prefs.getString("brickseek_zip", "") ?: "")
     val zipCode: StateFlow<String> = _zipCode.asStateFlow()
+
+    // Deal history (all deals ever found)
+    private val _dealHistory = MutableStateFlow<List<Deal>>(emptyList())
+    val dealHistory: StateFlow<List<Deal>> = _dealHistory.asStateFlow()
+
+    // Feed health status
+    data class FeedHealth(val label: String, val status: String, val lastSuccess: Long = 0) // "ok", "warn", "error"
+    private val _feedHealth = MutableStateFlow<List<FeedHealth>>(emptyList())
+    val feedHealth: StateFlow<List<FeedHealth>> = _feedHealth.asStateFlow()
+
+    // Category filter
+    private val _activeCategory = MutableStateFlow("All")
+    val activeCategory: StateFlow<String> = _activeCategory.asStateFlow()
+
+    // War room mode
+    private val _warRoomMode = MutableStateFlow(false)
+    val warRoomMode: StateFlow<Boolean> = _warRoomMode.asStateFlow()
+
+    // Smart priority: keyword click frequency
+    private val clickFrequency = mutableMapOf<String, Int>()
 
     // Persistent dedup sets
     private val processedIds = loadStringSet("processed_ids").toMutableSet()
@@ -408,8 +428,9 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
                     else -> fetchRssFeed(feed.url)
                 }
 
-                // Reset fail count on success
+                // Reset fail count on success + update feed health
                 feedFailCounts[feed.url] = 0
+                updateFeedHealth(feed.label, "ok")
 
                 for ((guid, title, link) in items) {
                     if (processedIds.contains(guid) || removedIds.contains(guid)) continue
@@ -469,7 +490,8 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
                 // #1: Track failure for backoff
                 val newFailCount = (feedFailCounts[feed.url] ?: 0) + 1
                 feedFailCounts[feed.url] = newFailCount
-                val backoffMs = (1 shl newFailCount.coerceAtMost(5)) * 120_000L // 4min, 8min, 16min...
+                updateFeedHealth(feed.label, if (newFailCount >= 3) "error" else "warn")
+                val backoffMs = (1 shl newFailCount.coerceAtMost(5)) * 120_000L
                 prefs.edit().putLong("feed_skip_${feed.url.hashCode()}", System.currentTimeMillis() + backoffMs).apply()
             }
         }
@@ -710,6 +732,14 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         return 0.0
+    }
+
+    private fun updateFeedHealth(label: String, status: String) {
+        val current = _feedHealth.value.toMutableList()
+        val idx = current.indexOfFirst { it.label == label }
+        val health = FeedHealth(label, status, if (status == "ok") System.currentTimeMillis() else current.getOrNull(idx)?.lastSuccess ?: 0)
+        if (idx >= 0) current[idx] = health else current.add(health)
+        _feedHealth.value = current
     }
 
     private fun extractStore(title: String): String {
@@ -969,6 +999,82 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ── Public actions ──
+
+    // Category filter
+    val CATEGORIES = listOf("All", "Electronics", "Gaming", "Home", "Fashion", "Grocery", "Other")
+    private val categoryKeywords = mapOf(
+        "Electronics" to listOf("tv", "monitor", "laptop", "phone", "headphone", "speaker", "camera", "tablet", "ssd", "gpu", "cpu", "rtx", "intel", "amd", "samsung", "apple", "sony"),
+        "Gaming" to listOf("game", "xbox", "playstation", "ps5", "ps4", "nintendo", "switch", "steam", "controller", "gaming"),
+        "Home" to listOf("home", "kitchen", "furniture", "vacuum", "mattress", "garden", "tool", "appliance", "depot"),
+        "Fashion" to listOf("shoe", "clothing", "jacket", "shirt", "pants", "nike", "adidas", "fashion", "apparel"),
+        "Grocery" to listOf("food", "grocery", "snack", "drink", "coffee", "supplement", "vitamin")
+    )
+
+    fun categorize(deal: Deal): String {
+        val t = deal.title.lowercase()
+        for ((cat, keywords) in categoryKeywords) {
+            if (keywords.any { t.contains(it) }) return cat
+        }
+        return "Other"
+    }
+
+    fun setCategory(cat: String) { _activeCategory.value = cat }
+    fun toggleWarRoom() { _warRoomMode.value = !_warRoomMode.value }
+
+    // Deal success tracking (#5)
+    fun markPurchased(deal: Deal) {
+        val current = _stats.value
+        val newStats = current.copy(
+            bestSavings = maxOf(current.bestSavings, deal.valueSavings),
+            bestDealTitle = if (deal.valueSavings > current.bestSavings) deal.title else current.bestDealTitle
+        )
+        _stats.value = newStats
+        // Persist total purchased savings
+        val totalSaved = prefs.getFloat("stats_total_saved", 0f) + deal.valueSavings.toFloat()
+        val totalPurchased = prefs.getInt("stats_total_purchased", 0) + 1
+        prefs.edit()
+            .putFloat("stats_total_saved", totalSaved)
+            .putInt("stats_total_purchased", totalPurchased)
+            .putFloat("stats_best_savings", newStats.bestSavings.toFloat())
+            .putString("stats_best_deal_title", newStats.bestDealTitle)
+            .apply()
+    }
+
+    fun getTotalSaved(): Double = prefs.getFloat("stats_total_saved", 0f).toDouble()
+    fun getTotalPurchased(): Int = prefs.getInt("stats_total_purchased", 0)
+
+    // Smart priority: track clicks (#7)
+    fun recordDealClick(deal: Deal) {
+        val words = deal.title.lowercase().split(Regex("\\s+"))
+        for (w in words) {
+            if (w.length > 3) clickFrequency[w] = (clickFrequency[w] ?: 0) + 1
+        }
+    }
+
+    fun getSmartScore(deal: Deal): Int {
+        val words = deal.title.lowercase().split(Regex("\\s+"))
+        return words.sumOf { clickFrequency[it] ?: 0 }
+    }
+
+    // Deal history
+    fun getFilteredHistory(query: String, category: String): List<Deal> {
+        val all = (_glitchDeals.value + _watchlistDeals.value).sortedByDescending { it.timestamp }
+        return all.filter { deal ->
+            val matchQuery = query.isBlank() || deal.title.contains(query, true) || deal.store.contains(query, true)
+            val matchCat = category == "All" || categorize(deal) == category
+            matchQuery && matchCat
+        }
+    }
+
+    // Export deals to CSV text
+    fun exportDealsCSV(): String {
+        val all = (_glitchDeals.value + _watchlistDeals.value).sortedByDescending { it.timestamp }
+        val sb = StringBuilder("Title,Price,Original,Discount,Store,URL,Status,Timestamp\n")
+        for (d in all) {
+            sb.append("\"${d.title}\",${d.price},${d.originalPrice},${d.discountPercentage}%,\"${d.store}\",\"${d.productUrl.ifBlank { d.url }}\",${d.status},${Date(d.timestamp)}\n")
+        }
+        return sb.toString()
+    }
 
     fun addKeyword(keyword: String) {
         if (keyword.isNotBlank()) {
