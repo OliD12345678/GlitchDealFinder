@@ -358,6 +358,7 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     private suspend fun fetchAndVerifyDeals() = withContext(Dispatchers.IO) {
+      try {
         val newGlitches = mutableListOf<Deal>()
         val newWatchlistDeals = mutableListOf<Deal>()
 
@@ -370,7 +371,7 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 _statusMessage.value = "Scanning: Twitter/X..."
                 val twitterItems = fetchTwitterDeals()
-                for ((guid, title, link) in twitterItems) {
+                for ((guid, title, link) in (twitterItems ?: emptyList())) {
                     if (processedIds.contains(guid) || removedIds.contains(guid)) continue
                     processedIds.add(guid)
                     val verifiedDeal = verifyDeal(title, link, guid)
@@ -394,7 +395,7 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 _statusMessage.value = "Scanning: BrickSeek (${_zipCode.value})..."
                 val bsItems = fetchBrickSeekDeals()
-                for ((guid, title, link) in bsItems) {
+                for ((guid, title, link) in (bsItems ?: emptyList())) {
                     if (processedIds.contains(guid)) continue
                     processedIds.add(guid)
                     val deal = Deal(
@@ -433,7 +434,7 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
                 feedFailCounts[feed.url] = 0
                 updateFeedHealth(feed.label, "ok")
 
-                for ((guid, title, link) in items) {
+                for ((guid, title, link) in (items ?: emptyList())) {
                     if (processedIds.contains(guid) || removedIds.contains(guid)) continue
 
                     val currentKeywords = _searchKeywords.value
@@ -515,6 +516,9 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
             // #3: Persist deals after update
             persistDeals()
         }
+      } catch (e: Exception) {
+        Log.e("DealFinder", "fetchAndVerifyDeals crashed: ${e.message}", e)
+      }
     }
 
     // ── Feed parsers ──
