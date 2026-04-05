@@ -87,10 +87,10 @@ fun MainScreen(viewModel: DealViewModel) {
     var showAddDialog by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
 
-    // #9: Play alert sound on new deal
+    // Play alert sound on new deal — unicorns get the most urgent sound
     LaunchedEffect(lastDeal) {
         if (lastDeal != null) {
-            playAlertSound(lastDeal!!.isGlitch)
+            playAlertSound(isGlitch = lastDeal!!.isGlitch, isUnicorn = lastDeal!!.isUnicorn)
         }
     }
 
@@ -294,9 +294,17 @@ fun DealList(
             }
         }
         items(deals) { deal ->
-            // #6: Visual distinction for unverified deals
-            val borderColor = if (!deal.verified) Color(0xFFFF9800) else Color.Transparent
-            val bgColor = if (!deal.verified) Color(0xFF1A1500) else Color(0xFF1A1A1A)
+            // Visual distinction: unicorn > glitch > unverified
+            val borderColor = when {
+                deal.isUnicorn -> Color(0xFFFFD700) // Gold border for unicorns
+                !deal.verified -> Color(0xFFFF9800) // Orange for unverified
+                else -> Color.Transparent
+            }
+            val bgColor = when {
+                deal.isUnicorn -> Color(0xFF1A1500) // Warm glow background
+                !deal.verified -> Color(0xFF1A1500)
+                else -> Color(0xFF1A1A1A)
+            }
 
             Surface(
                 onClick = { onDealClick(deal) },
@@ -304,14 +312,16 @@ fun DealList(
                 colors = ClickableSurfaceDefaults.colors(containerColor = bgColor),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .then(if (!deal.verified) Modifier.border(1.dp, borderColor, RoundedCornerShape(12.dp)) else Modifier)
+                    .then(if (borderColor != Color.Transparent) Modifier.border(1.dp, borderColor, RoundedCornerShape(12.dp)) else Modifier)
             ) {
                 Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(deal.title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                            // #6: Unverified badge
-                            if (!deal.verified) {
+                            if (deal.isUnicorn) {
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("🦄 UNICORN", color = Color(0xFFFFD700), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            } else if (!deal.verified) {
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text("⚠ UNVERIFIED", color = Color(0xFFFF9800), fontSize = 10.sp, fontWeight = FontWeight.Bold)
                             }
@@ -365,7 +375,10 @@ fun DealDetailPopup(deal: Deal, viewModel: DealViewModel, isAlert: Boolean, onDi
                 modifier = Modifier.padding(32.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                if (isAlert) {
+                if (isAlert && deal.isUnicorn) {
+                    Text("🦄 UNICORN FOUND! 🦄", color = Color(0xFFFFD700), style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                    Text("BUY NOW — THIS WILL BE FIXED!", color = Color.Red, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                } else if (isAlert) {
                     Text("🚨 GLITCH DETECTED! 🚨", color = Color.White, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                 } else {
                     Text("DEAL DETAILS", color = Color.Cyan, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
@@ -637,16 +650,23 @@ fun WebhookSettingsDialog(currentUrl: String, onDismiss: () -> Unit, onSave: (St
     }
 }
 
-// #9: Better alert sound — multi-tone sequence that grabs attention
-fun playAlertSound(isGlitch: Boolean) {
+// Alert sounds — escalating urgency: watchlist < glitch < unicorn
+fun playAlertSound(isGlitch: Boolean, isUnicorn: Boolean = false) {
     try {
-        val toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
-        if (isGlitch) {
-            // Urgent: three rapid ascending tones for a glitch
-            toneGen.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200)
-        } else {
-            // Gentler: single tone for watchlist match
-            toneGen.startTone(ToneGenerator.TONE_CDMA_PIP, 150)
+        val toneGen = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+        when {
+            isUnicorn -> {
+                // MAXIMUM URGENCY: rapid triple alarm for unicorns
+                toneGen.startTone(ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK, 300)
+            }
+            isGlitch -> {
+                // Urgent: alert tone for regular glitches
+                toneGen.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200)
+            }
+            else -> {
+                // Gentle: single pip for watchlist matches
+                toneGen.startTone(ToneGenerator.TONE_CDMA_PIP, 150)
+            }
         }
     } catch (e: Exception) {
         e.printStackTrace()

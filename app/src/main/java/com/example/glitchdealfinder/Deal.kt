@@ -26,6 +26,10 @@ data class Deal(
             return (discountPercentage >= 85) || (price > 0 && price <= 0.10)
         }
 
+    // Unicorn = sub-$1 or 95%+ off — the rarest finds
+    val isUnicorn: Boolean
+        get() = isGlitch && (price <= 1.00 || discountPercentage >= 95)
+
     // #8: Normalized key for cross-source dedup
     val dedupKey: String
         get() {

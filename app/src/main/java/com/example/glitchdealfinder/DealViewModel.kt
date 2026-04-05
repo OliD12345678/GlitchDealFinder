@@ -24,12 +24,28 @@ import java.util.concurrent.TimeUnit
 class DealViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences("GlitchDealFinderPrefs", Context.MODE_PRIVATE)
 
-    // #4: OkHttp with explicit timeouts and connection pool
+    // OkHttp with explicit timeouts, connection pool, and cookie jar for retailer sessions
+    private val cookieStore = mutableMapOf<String, MutableList<Cookie>>()
     private val client = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .writeTimeout(10, TimeUnit.SECONDS)
         .connectionPool(ConnectionPool(5, 30, TimeUnit.SECONDS))
+        .cookieJar(object : CookieJar {
+            override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+                val host = url.host
+                cookieStore.getOrPut(host) { mutableListOf() }.apply {
+                    // Replace existing cookies with same name
+                    val newNames = cookies.map { it.name }.toSet()
+                    removeAll { it.name in newNames }
+                    addAll(cookies)
+                }
+            }
+            override fun loadForRequest(url: HttpUrl): List<Cookie> {
+                return cookieStore[url.host] ?: emptyList()
+            }
+        })
+        .followRedirects(true)
         .build()
 
     private val _glitchDeals = MutableStateFlow<List<Deal>>(emptyList())
@@ -178,13 +194,15 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
     private fun startSearching() {
         viewModelScope.launch {
             while (true) {
+                scanCount++
                 _isSearching.value = true
                 _statusMessage.value = "Hunting for Glitches & Watchlist items..."
                 fetchAndVerifyDeals()
 
                 _isSearching.value = false
 
-                for (i in 120 downTo 1) {
+                // Faster cycle: 45s between scans (penny deals vanish in minutes)
+                for (i in 45 downTo 1) {
                     _secondsToNextScan.value = i
                     _statusMessage.value = "Next scan in ${i}s..."
                     delay(1000)
@@ -197,26 +215,43 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
 
     private data class FeedSource(
         val url: String,
-        val type: String = "rss", // "rss" or "reddit_json"
-        val label: String = url.substringAfterLast("/")
+        val type: String = "rss", // "rss", "reddit_json", or "brickseek"
+        val label: String = url.substringAfterLast("/"),
+        val tier: Int = 2 // 1 = every scan, 2 = every other scan, 3 = every 3rd scan
     )
 
+    private var scanCount = 0
+
     private val feeds = listOf(
-        FeedSource("https://slickdeals.net/newsearch.php?mode=frontpage&searcharea=deals&searchin=first&rss=1", label = "Slickdeals Front"),
-        FeedSource("https://slickdeals.net/newsearch.php?searcharea=deals&searchin=first&sort=newest&rss=1", label = "Slickdeals New"),
-        FeedSource("https://www.dealnews.com/c142/Home-Garden/?rss=1", label = "DealNews Home"),
-        FeedSource("https://www.dealnews.com/c39/Electronics/?rss=1", label = "DealNews Electronics"),
-        FeedSource("https://www.techbargains.com/rss", label = "TechBargains"),
-        // #1: Reddit JSON API as primary (more reliable than RSS)
-        FeedSource("https://www.reddit.com/r/buildapcsales/new/.json?limit=25", type = "reddit_json", label = "r/buildapcsales"),
-        FeedSource("https://www.reddit.com/r/deals/new/.json?limit=25", type = "reddit_json", label = "r/deals")
+        // Tier 1: High-velocity glitch sources — scanned every cycle (45s)
+        FeedSource("https://slickdeals.net/newsearch.php?searcharea=deals&searchin=first&sort=newest&rss=1", label = "Slickdeals New", tier = 1),
+        FeedSource("https://www.reddit.com/r/buildapcsales/new/.json?limit=25", type = "reddit_json", label = "r/buildapcsales", tier = 1),
+        FeedSource("https://www.reddit.com/r/deals/new/.json?limit=25", type = "reddit_json", label = "r/deals", tier = 1),
+        // Glitch-specific subreddits
+        FeedSource("https://www.reddit.com/r/glitchdeals/new/.json?limit=25", type = "reddit_json", label = "r/glitchdeals", tier = 1),
+        FeedSource("https://www.reddit.com/r/NintendoSwitchDeals/new/.json?limit=15", type = "reddit_json", label = "r/NintendoSwitchDeals", tier = 1),
+
+        // Tier 2: Standard deal sources — every other scan
+        FeedSource("https://slickdeals.net/newsearch.php?mode=frontpage&searcharea=deals&searchin=first&rss=1", label = "Slickdeals Front", tier = 2),
+        FeedSource("https://www.dealnews.com/c39/Electronics/?rss=1", label = "DealNews Electronics", tier = 2),
+        FeedSource("https://www.reddit.com/r/GameDeals/new/.json?limit=15", type = "reddit_json", label = "r/GameDeals", tier = 2),
+
+        // Tier 3: Slower sources — every 3rd scan
+        FeedSource("https://www.dealnews.com/c142/Home-Garden/?rss=1", label = "DealNews Home", tier = 3),
+        FeedSource("https://www.techbargains.com/rss", label = "TechBargains", tier = 3),
+        FeedSource("https://www.reddit.com/r/frugalmalefashion/new/.json?limit=15", type = "reddit_json", label = "r/frugalmalefashion", tier = 3),
+        FeedSource("https://www.reddit.com/r/ThriftStoreHauls/new/.json?limit=10", type = "reddit_json", label = "r/ThriftStoreHauls", tier = 3)
     )
 
     private suspend fun fetchAndVerifyDeals() = withContext(Dispatchers.IO) {
         val newGlitches = mutableListOf<Deal>()
         val newWatchlistDeals = mutableListOf<Deal>()
 
-        for (feed in feeds) {
+        // Tiered scanning: only process feeds whose tier matches this scan cycle
+        val activeFeeds = feeds.filter { scanCount % it.tier == 0 }
+        Log.d("DealFinder", "Scan #$scanCount: ${activeFeeds.size}/${feeds.size} feeds active")
+
+        for (feed in activeFeeds) {
             // #1: Exponential backoff — skip feeds that keep failing
             val failCount = feedFailCounts[feed.url] ?: 0
             if (failCount > 0) {
@@ -402,7 +437,12 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val currentPrice = parseCurrentPrice(priceDoc, title)
-            val originalPrice = parseHistoricalPrice(priceDoc, currentPrice)
+            var originalPrice = parseHistoricalPrice(priceDoc, currentPrice)
+            // CamelCamelCamel fallback for Amazon if we didn't find a historical price
+            if (originalPrice <= currentPrice && productUrl.contains("amazon.com", true)) {
+                val camelPrice = lookupCamelPrice(productUrl)
+                if (camelPrice > currentPrice) originalPrice = camelPrice
+            }
 
             // Refined check for free products vs free shipping
             if (currentPrice <= 0) {
@@ -494,6 +534,28 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
         return priceMatch?.value?.removePrefix("$")?.toDoubleOrNull() ?: 0.0
     }
 
+    // CamelCamelCamel price history for Amazon products
+    private fun lookupCamelPrice(productUrl: String): Double {
+        if (!productUrl.contains("amazon.com", true)) return 0.0
+        try {
+            // Extract ASIN from Amazon URL
+            val asinMatch = Regex("/(?:dp|gp/product)/([A-Z0-9]{10})").find(productUrl) ?: return 0.0
+            val asin = asinMatch.groupValues[1]
+            val camelUrl = "https://camelcamelcamel.com/product/$asin"
+            val doc = Jsoup.connect(camelUrl)
+                .userAgent(randomUserAgent())
+                .timeout(8000)
+                .get()
+            // Look for the highest price (MSRP approximation)
+            val highestText = doc.select(".highest_price .green, .stat_val").firstOrNull()?.text() ?: ""
+            val price = highestText.replace(Regex("[^\\d.]"), "").toDoubleOrNull()
+            if (price != null && price > 0) return price
+        } catch (e: Exception) {
+            Log.d("DealFinder", "CamelCamelCamel lookup failed: ${e.message}")
+        }
+        return 0.0
+    }
+
     private fun parseHistoricalPrice(doc: Document, currentPrice: Double): Double {
         val msrpSelectors = listOf(
             ".a-text-price", ".price-strike", ".was-price", ".list-price",
@@ -547,31 +609,59 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
         if (url.isBlank()) return
 
         try {
+            // Priority tiers: unicorn (sub-$1 or 95%+) vs regular glitch
+            val isUnicorn = deal.price <= 1.00 || deal.discountPercentage >= 95
+            val verifiedTag = if (deal.verified) "VERIFIED" else "UNVERIFIED"
+            val priorityTag = if (isUnicorn) "🦄 UNICORN" else "🚨 GLITCH"
+
             val json = JSONObject()
-            json.put("username", "Glitch Bot")
+            json.put("username", if (isUnicorn) "🦄 UNICORN ALERT" else "Glitch Bot")
             json.put("avatar_url", "https://cdn-icons-png.flaticon.com/512/5971/5971593.png")
 
+            // Unicorn deals get @everyone mention to ping all phones
+            if (isUnicorn) {
+                json.put("content", "**@everyone** 🦄 UNICORN DEAL FOUND — ACT NOW!")
+            }
+
             val embed = JSONObject()
-            val verifiedTag = if (deal.verified) "VERIFIED" else "UNVERIFIED"
-            embed.put("title", "🚨 GLITCH [$verifiedTag]: " + deal.title)
-            embed.put("description", "Found a deal at **${deal.store}**")
+            embed.put("title", "$priorityTag [$verifiedTag]: ${deal.title}")
+            embed.put("description", buildString {
+                append("Found a deal at **${deal.store}**\n")
+                if (isUnicorn) append("⚡ **THIS IS A UNICORN — BUY IMMEDIATELY BEFORE IT'S FIXED** ⚡\n")
+                if (!deal.verified) append("⚠️ Price could not be independently verified\n")
+            })
             embed.put("url", deal.productUrl.ifBlank { deal.url })
-            embed.put("color", if (deal.verified) 15158332 else 16776960) // Red for verified, yellow for unverified
+            // Colors: Unicorn = bright gold, Verified = red, Unverified = yellow
+            embed.put("color", when {
+                isUnicorn -> 16766720 // Gold
+                deal.verified -> 15158332 // Red
+                else -> 16776960 // Yellow
+            })
 
             val fields = JSONArray()
             fields.put(JSONObject().apply {
-                put("name", "Price")
-                put("value", if (deal.price <= 0.01) "PENNY/FREE" else "$${String.format(Locale.US, "%.2f", deal.price)}")
+                put("name", "💰 Price")
+                put("value", if (deal.price <= 0.01) "**PENNY/FREE** 🔥" else "**$${String.format(Locale.US, "%.2f", deal.price)}**")
                 put("inline", true)
             })
             fields.put(JSONObject().apply {
-                put("name", "Discount")
-                put("value", "${deal.discountPercentage}% OFF")
+                put("name", "📉 Discount")
+                put("value", "**${deal.discountPercentage}% OFF**")
                 put("inline", true)
             })
+            if (deal.originalPrice > 0) {
+                fields.put(JSONObject().apply {
+                    put("name", "📊 Was")
+                    put("value", "$${String.format(Locale.US, "%.2f", deal.originalPrice)}")
+                    put("inline", true)
+                })
+            }
 
             embed.put("fields", fields)
-            embed.put("footer", JSONObject().apply { put("text", "Glitch Deal Finder TV") })
+            embed.put("footer", JSONObject().apply {
+                put("text", "Glitch Deal Finder TV • ${if (isUnicorn) "CRITICAL PRIORITY" else "Standard Alert"}")
+            })
+            embed.put("timestamp", java.time.Instant.now().toString())
 
             val embeds = JSONArray()
             embeds.put(embed)
@@ -580,6 +670,8 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
             val body = json.toString().toRequestBody("application/json".toMediaType())
             val request = Request.Builder().url(url).post(body).build()
             client.newCall(request).execute().close()
+
+            Log.d("Discord", "Sent ${if (isUnicorn) "UNICORN" else "glitch"} alert: ${deal.title}")
         } catch (e: Exception) {
             Log.e("Discord", "Failed to send notification", e)
         }
