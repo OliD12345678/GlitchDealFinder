@@ -72,16 +72,33 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
     private val _webhookUrl = MutableStateFlow(prefs.getString("discord_webhook", "") ?: "")
     val webhookUrl: StateFlow<String> = _webhookUrl.asStateFlow()
 
-    // #3: Persistent dedup sets — loaded from SharedPreferences on startup
+    // #6: Telegram bot token + chat ID
+    private val _telegramBotToken = MutableStateFlow(prefs.getString("telegram_bot_token", "") ?: "")
+    val telegramBotToken: StateFlow<String> = _telegramBotToken.asStateFlow()
+    private val _telegramChatId = MutableStateFlow(prefs.getString("telegram_chat_id", "") ?: "")
+    val telegramChatId: StateFlow<String> = _telegramChatId.asStateFlow()
+
+    // #8: Separate webhook for unicorn-only alerts
+    private val _unicornWebhookUrl = MutableStateFlow(prefs.getString("discord_webhook_unicorn", "") ?: "")
+    val unicornWebhookUrl: StateFlow<String> = _unicornWebhookUrl.asStateFlow()
+
+    // #5: Stats tracking
+    private val _stats = MutableStateFlow(loadStats())
+    val stats: StateFlow<DealStats> = _stats.asStateFlow()
+
+    // #10: BrickSeek ZIP code
+    private val _zipCode = MutableStateFlow(prefs.getString("brickseek_zip", "") ?: "")
+    val zipCode: StateFlow<String> = _zipCode.asStateFlow()
+
+    // Persistent dedup sets
     private val processedIds = loadStringSet("processed_ids").toMutableSet()
     private val removedIds = loadStringSet("removed_ids").toMutableSet()
-    // #8: Cross-source dedup by normalized title+domain
     private val seenDedupKeys = loadStringSet("seen_dedup_keys").toMutableSet()
 
-    // #1: Per-feed backoff tracking
+    // Per-feed backoff tracking
     private val feedFailCounts = mutableMapOf<String, Int>()
 
-    // #5: Discord rate-limit queue
+    // Discord rate-limit queue
     private val discordQueue = mutableListOf<Deal>()
     private val discordMutex = Mutex()
 
@@ -95,11 +112,81 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     init {
-        // #3: Load persisted deals on startup
         loadPersistedDeals()
         startSearching()
-        // #5: Start Discord queue processor
         startDiscordQueueProcessor()
+        startExpiryChecker() // #1: periodic expiry detection
+    }
+
+    // ── Stats (#5) ──
+
+    data class DealStats(
+        val totalGlitchesFound: Int = 0,
+        val totalUnicorns: Int = 0,
+        val totalWatchlistHits: Int = 0,
+        val bestSavings: Double = 0.0,
+        val bestDealTitle: String = "",
+        val dealsToday: Int = 0,
+        val dealsThisWeek: Int = 0,
+        val todayDate: String = ""
+    )
+
+    private fun loadStats(): DealStats {
+        return DealStats(
+            totalGlitchesFound = prefs.getInt("stats_total_glitches", 0),
+            totalUnicorns = prefs.getInt("stats_total_unicorns", 0),
+            totalWatchlistHits = prefs.getInt("stats_total_watchlist", 0),
+            bestSavings = prefs.getFloat("stats_best_savings", 0f).toDouble(),
+            bestDealTitle = prefs.getString("stats_best_deal_title", "") ?: "",
+            dealsToday = prefs.getInt("stats_deals_today", 0),
+            dealsThisWeek = prefs.getInt("stats_deals_week", 0),
+            todayDate = prefs.getString("stats_today_date", "") ?: ""
+        )
+    }
+
+    private fun recordStats(deal: Deal, isWatchlist: Boolean) {
+        val today = java.text.SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        val current = _stats.value
+        val resetToday = current.todayDate != today
+        val newStats = current.copy(
+            totalGlitchesFound = current.totalGlitchesFound + if (deal.isGlitch) 1 else 0,
+            totalUnicorns = current.totalUnicorns + if (deal.isUnicorn) 1 else 0,
+            totalWatchlistHits = current.totalWatchlistHits + if (isWatchlist) 1 else 0,
+            bestSavings = maxOf(current.bestSavings, deal.valueSavings),
+            bestDealTitle = if (deal.valueSavings > current.bestSavings) deal.title else current.bestDealTitle,
+            dealsToday = (if (resetToday) 0 else current.dealsToday) + 1,
+            dealsThisWeek = current.dealsThisWeek + 1,
+            todayDate = today
+        )
+        _stats.value = newStats
+        prefs.edit()
+            .putInt("stats_total_glitches", newStats.totalGlitchesFound)
+            .putInt("stats_total_unicorns", newStats.totalUnicorns)
+            .putInt("stats_total_watchlist", newStats.totalWatchlistHits)
+            .putFloat("stats_best_savings", newStats.bestSavings.toFloat())
+            .putString("stats_best_deal_title", newStats.bestDealTitle)
+            .putInt("stats_deals_today", newStats.dealsToday)
+            .putInt("stats_deals_week", newStats.dealsThisWeek)
+            .putString("stats_today_date", newStats.todayDate)
+            .apply()
+    }
+
+    // ── Settings updates (#6, #8, #10) ──
+
+    fun updateTelegram(botToken: String, chatId: String) {
+        _telegramBotToken.value = botToken
+        _telegramChatId.value = chatId
+        prefs.edit().putString("telegram_bot_token", botToken).putString("telegram_chat_id", chatId).apply()
+    }
+
+    fun updateUnicornWebhook(url: String) {
+        _unicornWebhookUrl.value = url
+        prefs.edit().putString("discord_webhook_unicorn", url).apply()
+    }
+
+    fun updateZipCode(zip: String) {
+        _zipCode.value = zip
+        prefs.edit().putString("brickseek_zip", zip).apply()
     }
 
     // ── Persistence helpers (#3) ──
@@ -152,6 +239,8 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
                 put("originalPrice", d.originalPrice); put("store", d.store)
                 put("url", d.url); put("productUrl", d.productUrl)
                 put("verified", d.verified); put("timestamp", d.timestamp)
+                put("status", d.status.name); put("lastCheckedAt", d.lastCheckedAt)
+                put("zipCode", d.zipCode); put("inStore", d.inStore)
             })
         }
         return arr.toString()
@@ -168,7 +257,11 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
                 store = o.getString("store"), url = o.getString("url"),
                 productUrl = o.optString("productUrl", ""),
                 verified = o.optBoolean("verified", true),
-                timestamp = o.getLong("timestamp")
+                timestamp = o.getLong("timestamp"),
+                status = try { DealStatus.valueOf(o.optString("status", "LIVE")) } catch (e: Exception) { DealStatus.LIVE },
+                lastCheckedAt = o.optLong("lastCheckedAt", 0),
+                zipCode = o.optString("zipCode", ""),
+                inStore = o.optBoolean("inStore", false)
             ))
         }
         return list
@@ -251,6 +344,50 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
         val activeFeeds = feeds.filter { scanCount % it.tier == 0 }
         Log.d("DealFinder", "Scan #$scanCount: ${activeFeeds.size}/${feeds.size} feeds active")
 
+        // #3: Twitter scan every 3rd cycle (rate-limit friendly)
+        if (scanCount % 3 == 0) {
+            try {
+                _statusMessage.value = "Scanning: Twitter/X..."
+                val twitterItems = fetchTwitterDeals()
+                for ((guid, title, link) in twitterItems) {
+                    if (processedIds.contains(guid) || removedIds.contains(guid)) continue
+                    processedIds.add(guid)
+                    val verifiedDeal = verifyDeal(title, link, guid)
+                    if (verifiedDeal != null && verifiedDeal.isGlitch) {
+                        if (!seenDedupKeys.contains(verifiedDeal.dedupKey)) {
+                            newGlitches.add(verifiedDeal)
+                            seenDedupKeys.add(verifiedDeal.dedupKey)
+                            queueDiscordNotification(verifiedDeal)
+                            sendTelegramNotification(verifiedDeal)
+                            recordStats(verifiedDeal, false)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.d("DealFinder", "Twitter scan error: ${e.message}")
+            }
+        }
+
+        // #10: BrickSeek scan every 5th cycle
+        if (scanCount % 5 == 0 && _zipCode.value.length >= 5) {
+            try {
+                _statusMessage.value = "Scanning: BrickSeek (${_zipCode.value})..."
+                val bsItems = fetchBrickSeekDeals()
+                for ((guid, title, link) in bsItems) {
+                    if (processedIds.contains(guid)) continue
+                    processedIds.add(guid)
+                    val deal = Deal(
+                        id = guid, title = title, price = 0.0, originalPrice = 0.0,
+                        store = "Walmart (In-Store)", url = link, inStore = true,
+                        zipCode = _zipCode.value, verified = false
+                    )
+                    newWatchlistDeals.add(deal)
+                }
+            } catch (e: Exception) {
+                Log.d("DealFinder", "BrickSeek scan error: ${e.message}")
+            }
+        }
+
         for (feed in activeFeeds) {
             // #1: Exponential backoff — skip feeds that keep failing
             val failCount = feedFailCounts[feed.url] ?: 0
@@ -307,13 +444,15 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
                             if (verifiedDeal.isGlitch) {
                                 newGlitches.add(verifiedDeal)
                                 added = true
-                                // #5: Queue for Discord instead of firing immediately
                                 queueDiscordNotification(verifiedDeal)
+                                sendTelegramNotification(verifiedDeal) // #6
+                                recordStats(verifiedDeal, matchesWatchList) // #5
                             }
 
                             if (matchesWatchList) {
                                 newWatchlistDeals.add(verifiedDeal)
                                 added = true
+                                if (!verifiedDeal.isGlitch) recordStats(verifiedDeal, true)
                             }
 
                             if (added) {
@@ -605,12 +744,15 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun sendDiscordNotification(deal: Deal) {
-        val url = _webhookUrl.value
+        val isUnicorn = deal.isUnicorn
+        // #8: Use unicorn-specific webhook if configured, otherwise fall back to main
+        val url = if (isUnicorn && _unicornWebhookUrl.value.isNotBlank()) _unicornWebhookUrl.value else _webhookUrl.value
         if (url.isBlank()) return
 
+        // #8: If unicorn has its own webhook AND main webhook exists, also send to main
+        val alsoSendToMain = isUnicorn && _unicornWebhookUrl.value.isNotBlank() && _webhookUrl.value.isNotBlank()
+
         try {
-            // Priority tiers: unicorn (sub-$1 or 95%+) vs regular glitch
-            val isUnicorn = deal.price <= 1.00 || deal.discountPercentage >= 95
             val verifiedTag = if (deal.verified) "VERIFIED" else "UNVERIFIED"
             val priorityTag = if (isUnicorn) "🦄 UNICORN" else "🚨 GLITCH"
 
@@ -667,13 +809,162 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
             embeds.put(embed)
             json.put("embeds", embeds)
 
-            val body = json.toString().toRequestBody("application/json".toMediaType())
+            val bodyStr = json.toString()
+            val body = bodyStr.toRequestBody("application/json".toMediaType())
             val request = Request.Builder().url(url).post(body).build()
             client.newCall(request).execute().close()
+
+            // #8: Also send to main webhook if unicorn has its own channel
+            if (alsoSendToMain) {
+                val mainBody = bodyStr.toRequestBody("application/json".toMediaType())
+                val mainReq = Request.Builder().url(_webhookUrl.value).post(mainBody).build()
+                client.newCall(mainReq).execute().close()
+            }
 
             Log.d("Discord", "Sent ${if (isUnicorn) "UNICORN" else "glitch"} alert: ${deal.title}")
         } catch (e: Exception) {
             Log.e("Discord", "Failed to send notification", e)
+        }
+    }
+
+    // ── #1: Expiry checker — rescan live glitches to see if they're still active ──
+
+    private fun startExpiryChecker() {
+        viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                delay(90_000) // Check every 90 seconds
+                val liveDeals = _glitchDeals.value.filter { it.status == DealStatus.LIVE && it.verified }
+                for (deal in liveDeals.take(5)) { // Check up to 5 per cycle
+                    try {
+                        val checkUrl = deal.productUrl.ifBlank { deal.url }
+                        val doc = Jsoup.connect(checkUrl)
+                            .userAgent(randomUserAgent())
+                            .timeout(6000)
+                            .followRedirects(true)
+                            .get()
+                        val currentPrice = parseCurrentPrice(doc, deal.title)
+                        // If price jumped back up significantly, mark as expired
+                        val expired = currentPrice > 0 && deal.price > 0 &&
+                                currentPrice > deal.price * 2.0 // Price more than doubled = fixed
+                        val updatedDeal = deal.copy(
+                            status = if (expired) DealStatus.EXPIRED else DealStatus.LIVE,
+                            lastCheckedAt = System.currentTimeMillis()
+                        )
+                        _glitchDeals.value = _glitchDeals.value.map {
+                            if (it.id == deal.id) updatedDeal else it
+                        }
+                        if (expired) Log.d("DealFinder", "EXPIRED: ${deal.title}")
+                    } catch (e: Exception) {
+                        // Can't check — mark as unknown
+                        _glitchDeals.value = _glitchDeals.value.map {
+                            if (it.id == deal.id) it.copy(status = DealStatus.UNKNOWN, lastCheckedAt = System.currentTimeMillis()) else it
+                        }
+                    }
+                }
+                persistDeals()
+            }
+        }
+    }
+
+    // ── #3: Twitter/X scanner for real-time glitch mentions ──
+
+    private fun fetchTwitterDeals(): List<FeedItem> {
+        // Use Twitter's syndication/search (no API key needed, public search)
+        val queries = listOf("pricing+error", "price+glitch", "penny+deal", "walmart+glitch", "amazon+glitch")
+        val items = mutableListOf<FeedItem>()
+        for (query in queries) {
+            try {
+                val searchUrl = "https://nitter.net/search?f=tweets&q=$query&since=&until=&near="
+                val doc = Jsoup.connect(searchUrl)
+                    .userAgent(randomUserAgent())
+                    .timeout(8000)
+                    .get()
+                val tweets = doc.select(".timeline-item")
+                for (tweet in tweets.take(5)) {
+                    val text = tweet.select(".tweet-content").text()
+                    val tweetLink = tweet.select(".tweet-link").attr("href")
+                    val id = tweetLink.substringAfterLast("/").ifBlank { text.hashCode().toString() }
+                    // Extract URLs from tweet text
+                    val urlMatch = Regex("https?://\\S+").find(text)
+                    val link = urlMatch?.value ?: "https://nitter.net$tweetLink"
+                    if (text.isNotBlank()) items.add(FeedItem("tw_$id", text.take(200), link))
+                }
+            } catch (e: Exception) {
+                Log.d("DealFinder", "Twitter scan failed for $query: ${e.message}")
+            }
+        }
+        return items
+    }
+
+    // ── #10: BrickSeek in-store clearance scanner ──
+
+    private fun fetchBrickSeekDeals(): List<FeedItem> {
+        val zip = _zipCode.value
+        if (zip.isBlank() || zip.length < 5) return emptyList()
+        val items = mutableListOf<FeedItem>()
+        try {
+            // BrickSeek Walmart clearance feed
+            val url = "https://brickseek.com/walmart-clearance-finder/?zip=$zip"
+            val doc = Jsoup.connect(url)
+                .userAgent(randomUserAgent())
+                .timeout(10000)
+                .get()
+            val deals = doc.select(".item-list__item")
+            for (item in deals.take(10)) {
+                val title = item.select(".item-list__title").text()
+                val priceText = item.select(".item-list__price").text()
+                val link = item.select("a").attr("abs:href")
+                val id = link.hashCode().toString()
+                if (title.isNotBlank()) {
+                    items.add(FeedItem("bs_$id", "$title — $priceText (In-Store)", link))
+                }
+            }
+        } catch (e: Exception) {
+            Log.d("DealFinder", "BrickSeek scan failed: ${e.message}")
+        }
+        return items
+    }
+
+    // ── #6: Telegram notifications ──
+
+    private fun sendTelegramNotification(deal: Deal) {
+        val token = _telegramBotToken.value
+        val chatId = _telegramChatId.value
+        if (token.isBlank() || chatId.isBlank()) return
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val isUnicorn = deal.isUnicorn
+                val priceStr = if (deal.price <= 0.01) "PENNY/FREE" else "$${String.format(Locale.US, "%.2f", deal.price)}"
+                val emoji = if (isUnicorn) "🦄" else "🚨"
+                val priority = if (isUnicorn) "UNICORN" else "GLITCH"
+                val savings = if (deal.valueSavings > 0) " (save ${deal.valueSavingsFormatted})" else ""
+                val link = deal.productUrl.ifBlank { deal.url }
+                val cartLink = deal.cartUrl
+
+                val text = buildString {
+                    append("$emoji *$priority ALERT* $emoji\n\n")
+                    append("*${deal.title}*\n")
+                    append("💰 $priceStr at ${deal.store}$savings\n")
+                    append("📉 ${deal.discountPercentage}% OFF\n\n")
+                    append("🔗 [View Deal]($link)\n")
+                    if (cartLink != link) append("🛒 [Add to Cart]($cartLink)\n")
+                    if (isUnicorn) append("\n⚡ *ACT NOW — WILL BE FIXED SOON* ⚡")
+                }
+
+                val msgUrl = "https://api.telegram.org/bot$token/sendMessage"
+                val json = JSONObject().apply {
+                    put("chat_id", chatId)
+                    put("text", text)
+                    put("parse_mode", "Markdown")
+                    put("disable_web_page_preview", false)
+                }
+                val body = json.toString().toRequestBody("application/json".toMediaType())
+                val request = Request.Builder().url(msgUrl).post(body).build()
+                client.newCall(request).execute().close()
+            } catch (e: Exception) {
+                Log.e("Telegram", "Failed to send notification", e)
+            }
         }
     }
 
@@ -705,10 +996,23 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
         _lastFoundDeal.value = null
     }
 
-    // #10: Get shareable text for a deal
     fun getShareText(deal: Deal): String {
         val priceStr = if (deal.price <= 0.01) "FREE/PENNY" else "$${String.format(Locale.US, "%.2f", deal.price)}"
+        val emoji = if (deal.isUnicorn) "🦄" else "🚨"
+        val savings = if (deal.valueSavings > 0) " — save ${deal.valueSavingsFormatted}" else ""
         val link = deal.productUrl.ifBlank { deal.url }
-        return "🚨 Deal Alert: ${deal.title}\n${priceStr} at ${deal.store} (${deal.discountPercentage}% off)\n$link"
+        val cart = deal.cartUrl
+        return buildString {
+            append("$emoji Deal Alert: ${deal.title}\n")
+            append("$priceStr at ${deal.store} (${deal.discountPercentage}% off$savings)\n")
+            append("🔗 $link\n")
+            if (cart != link) append("🛒 Add to cart: $cart")
+        }
+    }
+
+    // #9: Voice search — add keyword from voice input
+    fun addKeywordFromVoice(text: String) {
+        val cleaned = text.trim()
+        if (cleaned.isNotBlank()) addKeyword(cleaned)
     }
 }

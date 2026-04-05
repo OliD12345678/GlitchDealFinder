@@ -1,18 +1,20 @@
 package com.example.glitchdealfinder
 
+import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.media.AudioAttributes
 import android.media.AudioManager
-import android.media.SoundPool
 import android.media.ToneGenerator
 import android.os.Bundle
+import android.speech.RecognizerIntent
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Image
@@ -82,10 +84,12 @@ fun MainScreen(viewModel: DealViewModel) {
     val lastDeal by viewModel.lastFoundDeal.collectAsState()
     val statusMessage by viewModel.statusMessage.collectAsState()
     val webhookUrl by viewModel.webhookUrl.collectAsState()
+    val stats by viewModel.stats.collectAsState()
 
     var selectedDeal by remember { mutableStateOf<Deal?>(null) }
     var showAddDialog by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
+    var showStats by remember { mutableStateOf(false) }
 
     // Play alert sound on new deal — unicorns get the most urgent sound
     LaunchedEffect(lastDeal) {
@@ -98,9 +102,20 @@ fun MainScreen(viewModel: DealViewModel) {
         Column(modifier = Modifier.fillMaxSize()) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Header(isSearching, statusMessage)
-                Button(onClick = { showSettingsDialog = true }) {
-                    Text("⚙️ NOTIFICATIONS")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { showStats = !showStats }) {
+                        Text("📊 STATS")
+                    }
+                    Button(onClick = { showSettingsDialog = true }) {
+                        Text("⚙️ SETTINGS")
+                    }
                 }
+            }
+
+            // #5: Stats dashboard (collapsible)
+            if (showStats) {
+                StatsBar(stats)
+                Spacer(modifier = Modifier.height(8.dp))
             }
 
             Spacer(modifier = Modifier.height(24.dp))
@@ -110,6 +125,7 @@ fun MainScreen(viewModel: DealViewModel) {
                     keywords = keywords,
                     onRemove = { viewModel.removeKeyword(it) },
                     onShowAdd = { showAddDialog = true },
+                    onVoiceResult = { viewModel.addKeywordFromVoice(it) },
                     modifier = Modifier.weight(1f)
                 )
 
@@ -153,13 +169,9 @@ fun MainScreen(viewModel: DealViewModel) {
         }
 
         if (showSettingsDialog) {
-            WebhookSettingsDialog(
-                currentUrl = webhookUrl,
-                onDismiss = { showSettingsDialog = false },
-                onSave = {
-                    viewModel.updateWebhook(it)
-                    showSettingsDialog = false
-                }
+            SettingsDialog(
+                viewModel = viewModel,
+                onDismiss = { showSettingsDialog = false }
             )
         }
     }
@@ -216,8 +228,19 @@ fun KeywordPanel(
     keywords: Set<String>,
     onRemove: (String) -> Unit,
     onShowAdd: () -> Unit,
+    onVoiceResult: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    // #9: Voice search launcher
+    val voiceLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val matches = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+            matches?.firstOrNull()?.let { onVoiceResult(it) }
+        }
+    }
+
     Column(modifier = modifier) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text("WATCH LIST", style = MaterialTheme.typography.titleMedium, color = Color.Yellow)
@@ -244,9 +267,56 @@ fun KeywordPanel(
         }
 
         Spacer(modifier = Modifier.height(16.dp))
-        Button(onClick = onShowAdd, modifier = Modifier.fillMaxWidth()) {
-            Text("+ ADD ITEM / VOICE")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Button(onClick = onShowAdd, modifier = Modifier.weight(1f)) {
+                Text("+ ADD")
+            }
+            // #9: Voice search button
+            Button(
+                onClick = {
+                    try {
+                        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                            putExtra(RecognizerIntent.EXTRA_PROMPT, "Say an item to watch for...")
+                        }
+                        voiceLauncher.launch(intent)
+                    } catch (e: Exception) {
+                        // Voice not available on this device
+                    }
+                },
+                colors = ButtonDefaults.colors(containerColor = Color(0xFF003300))
+            ) {
+                Text("🎤 VOICE")
+            }
         }
+    }
+}
+
+// #5: Stats dashboard bar
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+fun StatsBar(stats: DealViewModel.DealStats) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF0A1A0A), RoundedCornerShape(12.dp))
+            .padding(16.dp),
+        horizontalArrangement = Arrangement.SpaceEvenly
+    ) {
+        StatItem("🚨", "Glitches", stats.totalGlitchesFound.toString())
+        StatItem("🦄", "Unicorns", stats.totalUnicorns.toString())
+        StatItem("👀", "Watchlist", stats.totalWatchlistHits.toString())
+        StatItem("📅", "Today", stats.dealsToday.toString())
+        StatItem("💰", "Best Save", if (stats.bestSavings > 0) String.format(Locale.US, "$%.0f", stats.bestSavings) else "-")
+    }
+}
+
+@Composable
+fun StatItem(emoji: String, label: String, value: String) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(emoji, fontSize = 20.sp)
+        Text(value, color = Color(0xFF00FFCC), fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        Text(label, color = Color.Gray, fontSize = 10.sp)
     }
 }
 
@@ -326,7 +396,18 @@ fun DealList(
                                 Text("⚠ UNVERIFIED", color = Color(0xFFFF9800), fontSize = 10.sp, fontWeight = FontWeight.Bold)
                             }
                         }
-                        Text("${deal.store} • ${dateFormat.format(Date(deal.timestamp))}", color = Color.Gray, fontSize = 12.sp)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("${deal.store} • ${dateFormat.format(Date(deal.timestamp))}", color = Color.Gray, fontSize = 12.sp)
+                            // #1/#7: Expiry status
+                            when (deal.status) {
+                                DealStatus.EXPIRED -> { Spacer(Modifier.width(6.dp)); Text("☠ DEAD", color = Color.Red, fontSize = 10.sp, fontWeight = FontWeight.Bold) }
+                                DealStatus.LIVE -> if (deal.minutesAlive in 1..15) { Spacer(Modifier.width(6.dp)); Text("⏱ ${deal.minutesAlive}m", color = Color(0xFF00FF00), fontSize = 10.sp) }
+                                DealStatus.UNKNOWN -> { Spacer(Modifier.width(6.dp)); Text("❓", fontSize = 10.sp) }
+                                else -> {}
+                            }
+                            // #10: In-store badge
+                            if (deal.inStore) { Spacer(Modifier.width(6.dp)); Text("🏪 IN-STORE", color = Color(0xFF00BFFF), fontSize = 10.sp, fontWeight = FontWeight.Bold) }
+                        }
                     }
 
                     Spacer(modifier = Modifier.width(12.dp))
@@ -344,6 +425,15 @@ fun DealList(
                             color = Color.Green,
                             style = MaterialTheme.typography.bodySmall
                         )
+                        // #4: Show absolute dollar savings
+                        if (deal.valueSavings > 0) {
+                            Text(
+                                text = "SAVE ${deal.valueSavingsFormatted}",
+                                color = Color(0xFF00FF88),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
                 }
             }
@@ -408,10 +498,26 @@ fun DealDetailPopup(deal: Deal, viewModel: DealViewModel, isAlert: Boolean, onDi
                             color = Color.Green,
                             fontWeight = FontWeight.Bold
                         )
-                        if (deal.originalPrice > 0) {
-                            Text("was $${String.format(Locale.US, "%.2f", deal.originalPrice)}", color = Color.Gray, fontSize = 14.sp)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (deal.originalPrice > 0) {
+                                Text("was $${String.format(Locale.US, "%.2f", deal.originalPrice)}", color = Color.Gray, fontSize = 14.sp)
+                            }
+                            // #4: Absolute savings
+                            if (deal.valueSavings > 0) {
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Text("SAVE ${deal.valueSavingsFormatted}", color = Color(0xFF00FF88), fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                            }
                         }
                         Text("at ${deal.store}", color = Color.LightGray)
+                        // #7: Alive countdown
+                        if (deal.status == DealStatus.LIVE && deal.minutesAlive > 0) {
+                            Text("⏱ Live for ${deal.minutesAlive} min — glitches avg ~8 min", color = Color(0xFF00FF00), fontSize = 12.sp)
+                        } else if (deal.status == DealStatus.EXPIRED) {
+                            Text("☠ This deal has been fixed", color = Color.Red, fontSize = 12.sp)
+                        }
+                        if (deal.inStore) {
+                            Text("🏪 In-store only — ZIP: ${deal.zipCode}", color = Color(0xFF00BFFF), fontSize = 12.sp)
+                        }
                     }
 
                     Spacer(modifier = Modifier.width(24.dp))
@@ -426,8 +532,27 @@ fun DealDetailPopup(deal: Deal, viewModel: DealViewModel, isAlert: Boolean, onDi
 
                 Spacer(modifier = Modifier.height(24.dp))
 
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    // #10: Share button
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // #2: Auto-cart deep link
+                    if (deal.status != DealStatus.EXPIRED) {
+                        Button(
+                            onClick = {
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                clipboard.setPrimaryClip(ClipData.newPlainText("Cart URL", deal.cartUrl))
+                                try {
+                                    val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(deal.cartUrl))
+                                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    context.startActivity(intent)
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "Cart link copied!", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            colors = ButtonDefaults.colors(containerColor = Color(0xFF004400))
+                        ) {
+                            Text("🛒 BUY NOW")
+                        }
+                    }
+                    // Share button
                     Button(
                         onClick = {
                             val shareText = viewModel.getShareText(deal)
@@ -583,15 +708,24 @@ fun AddKeywordDialog(onDismiss: () -> Unit, onAdd: (String) -> Unit) {
     }
 }
 
+// Comprehensive settings dialog (#6, #8, #10)
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-fun WebhookSettingsDialog(currentUrl: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
-    var text by remember { mutableStateOf(currentUrl) }
+fun SettingsDialog(viewModel: DealViewModel, onDismiss: () -> Unit) {
+    val webhook by viewModel.webhookUrl.collectAsState()
+    val unicornWebhook by viewModel.unicornWebhookUrl.collectAsState()
+    val telegramToken by viewModel.telegramBotToken.collectAsState()
+    val telegramChat by viewModel.telegramChatId.collectAsState()
+    val zip by viewModel.zipCode.collectAsState()
+
+    var discordUrl by remember { mutableStateOf(webhook) }
+    var unicornUrl by remember { mutableStateOf(unicornWebhook) }
+    var tgToken by remember { mutableStateOf(telegramToken) }
+    var tgChat by remember { mutableStateOf(telegramChat) }
+    var zipCode by remember { mutableStateOf(zip) }
     val focusRequester = remember { FocusRequester() }
 
-    LaunchedEffect(Unit) {
-        focusRequester.requestFocus()
-    }
+    LaunchedEffect(Unit) { focusRequester.requestFocus() }
 
     Box(
         modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.9f)),
@@ -603,49 +737,66 @@ fun WebhookSettingsDialog(currentUrl: String, onDismiss: () -> Unit, onSave: (St
             colors = ClickableSurfaceDefaults.colors(containerColor = Color(0xFF1E1E1E)),
             modifier = Modifier.width(700.dp)
         ) {
-            Column(
+            LazyColumn(
                 modifier = Modifier.padding(32.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text("DISCORD NOTIFICATIONS", style = MaterialTheme.typography.headlineSmall, color = Color.Cyan)
-                Spacer(modifier = Modifier.height(8.dp))
-                Text("Enter Discord Webhook URL for phone alerts.", color = Color.Gray)
-
-                Spacer(modifier = Modifier.height(24.dp))
-
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color.Black, RoundedCornerShape(8.dp))
-                        .padding(16.dp)
-                ) {
-                    BasicTextField(
-                        value = text,
-                        onValueChange = { text = it },
-                        modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
-                        textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 16.sp),
-                        cursorBrush = SolidColor(Color(0xFF00FFCC)),
-                        singleLine = true,
-                        decorationBox = { innerTextField ->
-                            if (text.isEmpty()) {
-                                Text("Paste Webhook URL here...", color = Color.DarkGray, fontSize = 16.sp)
-                            }
-                            innerTextField()
-                        }
-                    )
+                item {
+                    Text("SETTINGS", style = MaterialTheme.typography.headlineSmall, color = Color.Cyan)
+                    Spacer(modifier = Modifier.height(24.dp))
                 }
 
-                Spacer(modifier = Modifier.height(32.dp))
+                // Discord — main webhook
+                item { SettingsField("Discord Webhook (all deals)", discordUrl, focusRequester) { discordUrl = it } }
+                // Discord — unicorn-only webhook (#8)
+                item { SettingsField("Unicorn-Only Webhook (optional)", unicornUrl) { unicornUrl = it } }
+                // Telegram (#6)
+                item { SettingsField("Telegram Bot Token", tgToken) { tgToken = it } }
+                item { SettingsField("Telegram Chat ID", tgChat) { tgChat = it } }
+                // BrickSeek ZIP (#10)
+                item { SettingsField("ZIP Code (for in-store deals)", zipCode) { zipCode = it } }
 
-                Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    Button(onClick = { onSave(text) }) {
-                        Text("SAVE URL")
-                    }
-                    Button(onClick = onDismiss) {
-                        Text("CANCEL")
+                item {
+                    Spacer(modifier = Modifier.height(24.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        Button(onClick = {
+                            viewModel.updateWebhook(discordUrl)
+                            viewModel.updateUnicornWebhook(unicornUrl)
+                            viewModel.updateTelegram(tgToken, tgChat)
+                            viewModel.updateZipCode(zipCode)
+                            onDismiss()
+                        }) { Text("SAVE ALL") }
+                        Button(onClick = onDismiss) { Text("CANCEL") }
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun SettingsField(label: String, value: String, focusReq: FocusRequester? = null, onValueChange: (String) -> Unit) {
+    Column(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
+        Text(label, color = Color.Gray, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        Spacer(modifier = Modifier.height(4.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color.Black, RoundedCornerShape(8.dp))
+                .padding(12.dp)
+        ) {
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                modifier = Modifier.fillMaxWidth().then(if (focusReq != null) Modifier.focusRequester(focusReq) else Modifier),
+                textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 14.sp),
+                cursorBrush = SolidColor(Color(0xFF00FFCC)),
+                singleLine = true,
+                decorationBox = { innerTextField ->
+                    if (value.isEmpty()) Text("Enter $label...", color = Color.DarkGray, fontSize = 14.sp)
+                    innerTextField()
+                }
+            )
         }
     }
 }
