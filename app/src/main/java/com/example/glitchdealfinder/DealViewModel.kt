@@ -18,6 +18,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.TimeUnit
 
@@ -833,7 +834,7 @@ class DealViewModel(application: Application) : AndroidViewModel(application) {
             embed.put("footer", JSONObject().apply {
                 put("text", "Glitch Deal Finder TV • ${if (isUnicorn) "CRITICAL PRIORITY" else "Standard Alert"}")
             })
-            embed.put("timestamp", java.time.Instant.now().toString())
+            embed.put("timestamp", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date()))
 
             val embeds = JSONArray()
             embeds.put(embed)
